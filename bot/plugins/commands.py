@@ -30,7 +30,7 @@ CUSTOM_CAPTIONS = {}
 
 # YTDLP Configuration
 YTDL_OPTS = {
-    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Default: MP4
+    'format': 'bestvideo+bestaudio/best',  # Default: MKV or MP4
     'outtmpl': '%(title)s-%(id)s.%(ext)s',  # Filename format
     'noplaylist': True,
     'nocheckcertificate': True,
@@ -111,6 +111,7 @@ async def start_command(client: Client, message: Message):
     await message.reply_text(
         "Hi! I'm a Stream downloader and uploader bot.\n"
         "Send me a M3U8, MPD, or HTTP link, and I'll download the video and upload it to Telegram.\n\n"
+        "You can specify a start time using the format: `link | start_time` (e.g., `https://example.com/stream.m3u8 | 00:01:30`)\n\n"
         "**Commands:**\n"
         "/start - Start the bot\n"
         "/set_thumbnail - Set a custom thumbnail\n"
@@ -162,39 +163,50 @@ async def reset_caption(client: Client, message: Message):
         await message.reply_text("You don't have a custom caption set.")
 
 async def download_and_upload(client: Client, message: Message, link: str):
-    """Downloads a video and uploads it to Telegram, handling M3U8, MPD, and HTTP links."""
+    """Downloads a video and uploads it to Telegram, handling M3U8, MPD, and HTTP links with custom timestamp."""
     user_id = message.from_user.id
+    start_time_str = None  # Initialize start_time_str
+    if "|" in link:
+        link, start_time_str = link.split("|", 1)  # Split link and timestamp
+        link = link.strip()
+        start_time_str = start_time_str.strip()
+
+        # Validate the timestamp format (HH:MM:SS or MM:SS or SS)
+        if not re.match(r"^(\d{2}:)?\d{2}:\d{2}$|^\d{2}:\d{2}$|^\d+$", start_time_str):
+            await message.reply_text("Invalid timestamp format. Please use HH:MM:SS, MM:SS, or seconds.")
+            return
 
     # Modify yt-dlp options for MKV format and progress reporting
     YTDL_OPTS['format'] = 'bestvideo+bestaudio/best'
-    YTDL_OPTS['progress_hooks'] = [lambda d: download_progress_hook(d, message, time.time())] # Pass the message object
+    YTDL_OPTS['progress_hooks'] = [lambda d: download_progress_hook(d, message, time.time())]
 
-    temp_file_path = None  # Initialize
+    if start_time_str:
+        YTDL_OPTS['ss'] = start_time_str  # Set the start time
+
+    temp_file_path = None
 
     try:
         with YoutubeDL(YTDL_OPTS) as ydl:
             info_dict = ydl.extract_info(link, download=False)
             file_name = info_dict.get('title', 'Stream') + "." + info_dict.get('ext', 'mp4')  # Default to mp4
-            file_name = re.sub(r'[^\w\s.-]', '', file_name) # Remove invalid characters
-            file_name = file_name[:60] # Limit file name length
+            file_name = re.sub(r'[^\w\s.-]', '', file_name)
+            file_name = file_name[:60]
 
-
-            # Check file size before downloading (this is an estimate and might not be entirely accurate)
+            # Check file size before downloading (estimate)
             if 'filesize' in info_dict and info_dict['filesize'] > MAX_FILE_SIZE:
                 await message.reply_text(f"Estimated file size exceeds the maximum allowed size of 4GB. Estimated file size: {info_dict['filesize'] / (1024 * 1024 * 1024):.2f} GB")
                 return
 
             download_message = await message.reply_text(f"Starting download of `{file_name}`...")
             start_time = time.time()
-            temp_file_path = os.path.join("./downloads", file_name) # Full path
+            temp_file_path = os.path.join("./downloads", file_name)
 
             # Now download the file
-            ydl.download([link]) #Downloads to the temp_file_path defined in the YTDL_OPTS
+            ydl.download([link])
 
             if not os.path.exists(temp_file_path):
-                await download_message.edit_text("Download failed.  Please check the link and try again.")
+                await download_message.edit_text("Download failed. Please check the link and try again.")
                 return
-
 
             # Upload to Telegram
             upload_message = await message.reply_text(f"Starting upload of `{file_name}`...")
@@ -206,18 +218,16 @@ async def download_and_upload(client: Client, message: Message, link: str):
                 # If user has no custom thumbnail set, try to automatically extract a thumbnail
                 if not thumb:
                      try:
-                         # Attempt to extract thumbnail using yt-dlp
                          ydl_opts = {'writesubtitles': False, 'writethumbnail': True, 'quiet': True, 'no_warnings': True}
                          with YoutubeDL(ydl_opts) as ydl:
                              info_dict = ydl.extract_info(temp_file_path, download=False)
                              if 'thumbnail' in info_dict:
                                  thumb = info_dict['thumbnail']
-                                 # Download the thumbnail if it's a URL
                                  if thumb.startswith('http'):
                                      async with aiohttp.ClientSession() as session:
                                          async with session.get(thumb) as resp:
                                              if resp.status == 200:
-                                                 thumb = BytesIO(await resp.read()) # Store thumbnail data in memory
+                                                 thumb = BytesIO(await resp.read())
                                                  print("Successfully downloaded thumbnail from URL.")
                                              else:
                                                  print(f"Failed to download thumbnail from URL: {resp.status}")
@@ -230,9 +240,8 @@ async def download_and_upload(client: Client, message: Message, link: str):
                         print(f"Error extracting thumbnail: {e}")
                         thumb = None
 
-
                 # Default caption
-                caption = CUSTOM_CAPTIONS.get(user_id, f"Uploaded by @{Client.me.username}")
+                caption = CUSTOM_CAPTIONS.get(user_id, f"Uploaded by @{app.me.username}")
 
                 # Get video duration for proper display in Telegram.  This is important
                 duration = 0 # Set Default
@@ -260,7 +269,7 @@ async def download_and_upload(client: Client, message: Message, link: str):
                 await message.reply_text("Upload complete!")
 
             except Exception as e:
-                await message.reply_text(f"Upload failed: {e}\n\n{traceback.format_exc()}") # Provide full traceback
+                await message.reply_text(f"Upload failed: {e}\n\n{traceback.format_exc()}")
                 logging.error(f"Upload error: {e}\n{traceback.format_exc()}")
 
     except yt_dlp.utils.DownloadError as e:
@@ -273,29 +282,29 @@ async def download_and_upload(client: Client, message: Message, link: str):
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             try:
-                os.remove(temp_file_path) # Clean up the downloaded file
+                os.remove(temp_file_path)
             except Exception as e:
                 print(f"Failed to delete temporary file: {e}")
                 logging.warning(f"Failed to delete temporary file: {e}")
-        YTDL_OPTS['progress_hooks'] = [] # Remove progress hook
+        YTDL_OPTS['progress_hooks'] = []
+        if 'ss' in YTDL_OPTS:
+            del YTDL_OPTS['ss']  # Remove start time after download
 
 def download_progress_hook(d, message: MSG, start_time):
     """yt-dlp progress hook to display download progress."""
     if d['status'] == 'downloading':
         current = d['downloaded_bytes']
         total = d['total_bytes']
-        file_name = d['filename']  # Get filename from yt-dlp
+        file_name = d['filename']
         asyncio.create_task(download_progress(current, total, message, start_time, file_name))
     elif d['status'] == 'finished':
-        # Download is complete, you can optionally do something here
         logging.info("Download complete.")
         pass
     elif d['status'] == 'error':
         logging.error(f"Download failed: {d['error']}")
-        # Handle the error here
 
-@Client.on_message(filters.regex(r"https?://\S+"))
+@Client.on_message(filters.regex(r"https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+"))
 async def link_handler(client: Client, message: Message):
-    """Handles messages containing links."""
+    """Handles messages containing links with optional timestamp."""
     link = message.text.strip()
     await download_and_upload(client, message, link)
