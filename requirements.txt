@@ -1,14 +1,9 @@
-asyncio
-pillow
-pyromod==1.5
-aiohttp
-beautifulsoup4
-hachoir
-sqlalchemy
-psycopg2-binary
-numpy
-pyrogram
-requests
-tgcrypto
-#youtube-dl
-git+https://github.com/prgofficial/YouTubeDL
+ pyrogram
+  tgcrypto
+  asyncio
+  aiohttp
+  hachoir
+  requests
+  yt-dlp
+  pillow
+  pyromod==1.5
