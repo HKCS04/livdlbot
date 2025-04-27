@@ -1,208 +1,301 @@
-import os
 import asyncio
+import os
 import re
-import requests
+import time
+import traceback
 from io import BytesIO
-from pyrogram import Client, filters
-from pyrogram.types import Message, InputMediaDocument
-from dotenv import load_dotenv
-from PIL import Image  # for basic image validation
-import youtube_dl
-from bs4 import BeautifulSoup
+import logging
+
 import aiohttp
+import pyrogram
+import requests
+import yt_dlp
+from PIL import Image
+from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
+                            InlineKeyboardMarkup, Message, InputMediaVideo)
+from pyrogram.types import InputMediaPhoto
+from pyrogram.types import Message as MSG
+from yt_dlp import YoutubeDL
 
-# Progress Bar Characters
-BAR_FILLED = "█"
-BAR_EMPTY = "░"
-TOTAL_BAR_LENGTH = 20
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Telegram File Size Limit (4 GB)
-MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4 GB in bytes
+OWNER_ID = "8083702486"
+MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4GB
+CUSTOM_THUMBNAILS = {}
+CUSTOM_CAPTIONS = {}
 
-# Custom Thumbnail Path (Initialize to None)
-CUSTOM_THUMBNAIL = {} #Dictionary for Multiple Users
+# YTDLP Configuration
+YTDL_OPTS = {
+    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Default: MP4
+    'outtmpl': '%(title)s-%(id)s.%(ext)s',  # Filename format
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': True,
+    'quiet': True,
+    'no_warnings': True,
+    'source_address': '0.0.0.0',  # Bind to ipv4 since ipv6 addresses cause issues sometimes
+    'progress_hooks': [],
+}
 
-# Custom Caption (Initialize to None)
-CUSTOM_CAPTION = {} #Dictionary for Multiple Users
+# Progress bar symbols
+BAR = [
+    "▰",
+    "▱",
+]
 
-
-# Function to format progress bar
-def format_progress_bar(percentage):
-    """Formats a progress bar using decorative text symbols."""
-    filled_length = int(TOTAL_BAR_LENGTH * percentage)
-    bar = BAR_FILLED * filled_length + BAR_EMPTY * (TOTAL_BAR_LENGTH - filled_length)
-    return bar
-
-# Function to extract the default thumbnail with aiohttp (async)
-async def get_default_thumbnail(url):
-    """Extracts the thumbnail URL from the webpage using aiohttp and BeautifulSoup."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                response.raise_for_status()  # Raise HTTPError for bad responses
-                html_content = await response.text()
-
-        soup = BeautifulSoup(html_content, 'html.parser')
-        meta_tag = soup.find('meta', property='og:image')  # Use BeautifulSoup to find the meta tag
-        if meta_tag:
-            thumbnail_url = meta_tag['content']
-            return thumbnail_url
-        else:
-            print("Thumbnail URL not found in the HTML.")
-            return None
-
-    except aiohttp.ClientError as e:
-        print(f"Error fetching webpage: {e}")
-        return None
-    except Exception as e:
-        print(f"Error processing HTML: {e}")
-        return None
-
-
-async def download_thumbnail(url):
-    """Downloads a thumbnail from a URL and returns its file path."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                image_data = await response.read()  # Read image data as bytes
-
-        image = Image.open(BytesIO(image_data))
-        thumbnail_path = "default_thumbnail.jpg"
-        image.save(thumbnail_path, "JPEG")
-        return thumbnail_path
-
-    except aiohttp.ClientError as e:
-        print(f"Error downloading thumbnail: {e}")
-        return None
-    except Exception as e:
-        print(f"Error processing thumbnail: {e}")
-        return None
-
-
-# Function to download and upload the video
-async def download_and_upload(message: Message, url: str):
-    """Downloads a video from a URL and uploads it to Telegram."""
-    try:
-        await message.reply_text("Downloading...")
-        ydl_opts = {
-            'format': 'bestvideo+bestaudio/best',  # Download best available video and audio
-            'outtmpl': '%(title)s.%(ext)s',  # Output template
-            'merge_output_format': 'mkv',  # Force mkv output to merge video and audio
-            'progress_hooks': [progress_hook],  # Add the progress hook for console output
-        }
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:  # Using youtube_dl here
-            try:
-                info_dict = ydl.extract_info(url, download=True)  # Download the url file
-            except youtube_dl.utils.DownloadError as e:
-                await message.reply_text(f"Download Error: {e}")
-                return
-
-            file_path = ydl.prepare_filename(info_dict)  # Get the downloaded file path
-
-        # Basic File Check
-        if not os.path.exists(file_path):
-            await message.reply_text("Error: File download failed.")
-            return
-
-        # Check File Size
-        file_size = os.path.getsize(file_path)
-        if file_size > MAX_FILE_SIZE:
-            await message.reply_text(f"Error: File size exceeds the maximum allowed size of 4 GB. File size: {file_size} bytes.")
-            os.remove(file_path)  # Delete the downloaded file
-            return
-
-        # Sending to Telegram
-        await message.reply_text("Uploading...")
-        try:
-            user_id = message.chat.id
-            thumbnail = CUSTOM_THUMBNAIL.get(user_id)
-
-            # If no custom thumbnail, use the default
-            if not thumbnail:
-                default_thumbnail_url = await get_default_thumbnail(url)
-                if default_thumbnail_url:
-                    thumbnail = await download_thumbnail(default_thumbnail_url)
-                else:
-                    thumbnail = None #No thumbnail found at all
-
-            caption = CUSTOM_CAPTION.get(user_id, info_dict.get('title', 'Video from URL'))
-
-            await app.send_document(chat_id=user_id, document=file_path,
-                                  caption=caption, thumb=thumbnail,
-                                  progress=upload_progress, progress_args=(user_id, "Uploading:"))
-
-        except Exception as e:  # File limit reached
-            await message.reply_text(f"Error: Uploading failed.\n{e}")  # File Limit reached or other error
-        finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)  # Clean Up the downloaded file
-            if thumbnail == "default_thumbnail.jpg" and os.path.exists(thumbnail):
-                os.remove(thumbnail)  # Remove the default thumbnail
-
-        await message.reply_text("Download and Upload complete!")
-
-    except Exception as e:
-        await message.reply_text(f"An unexpected error occurred:\n{e}")
-
-
-# Custom upload progress function
-async def upload_progress(current, total, chat_id, message_text):
-    """Displays upload progress in Telegram chat action."""
+def create_progress_bar(current, total):
+    """Creates a fancy progress bar."""
     percentage = current / total
-    progress_bar = format_progress_bar(percentage)
-    message = f"{message_text} {progress_bar} {percentage * 100:.1f}%"
-    try:
-        await app.send_chat_action(chat_id, "upload_document")
-    except Exception as e:
-        print(f"Error during progress update : {e}")
+    filled_segments = int(percentage * 10)
+    remaining_segments = 10 - filled_segments
+    bar = BAR[0] * filled_segments + BAR[1] * remaining_segments
+    return bar, percentage * 100
 
+async def download_progress(current, total, message: MSG, start_time, file_name):
+    """Displays download progress bar in Telegram."""
+    now = time.time()
+    diff = now - start_time
+    if round(diff % 3) == 0:  # Update every 3 seconds
+        bar, percentage = create_progress_bar(current, total)
+        speed = current / diff
+        eta = (total - current) / speed
+        time_elapsed = time.strftime("%H:%M:%S", time.gmtime(diff))
+        estimated_time = time.strftime("%H:%M:%S", time.gmtime(eta))
 
-# Command handler for setting custom thumbnail using user-sent image
-@Client.on_message(filters.photo)  # Listen for photo messages
-async def setthumbnail_photo(client: Client, message: Message):
-    """Sets the custom thumbnail to the photo sent by the user."""
-    user_id = message.chat.id
-    try:
-        # Download the photo
-        file_path = await client.download_media(message)  # Downloads the image
         try:
-            # Validate it's an image (basic check)
-            Image.open(file_path).verify()  # Raises exception if not an image or corrupted
-            CUSTOM_THUMBNAIL[user_id] = file_path
-            await message.reply_text("Custom thumbnail set successfully!")
-        except Exception as e:
-            await message.reply_text("Error: The file you sent is not a valid image.")
-            os.remove(file_path) #removes file for the user
-    except Exception as e:
-        await message.reply_text(f"Error downloading image: {e}")
-        if os.path.exists(file_path): #Removes the file
-            os.remove(file_path)
-
-# Command handler for setting custom caption
-@Client.on_message(filters.command("setcaption"))
-async def setcaption_command(client: Client, message: Message):
-    """Sets a custom caption for the user."""
-    user_id = message.chat.id
-    if len(message.command) > 1:
-        caption = message.text.split(" ", 1)[1]
-        CUSTOM_CAPTION[user_id] = caption
-        await message.reply_text(f"Custom caption set to: {caption}")
-    else:
-        await message.reply_text("Usage: /setcaption <custom_caption>")
-
-# Message handler for SonyLiv links
-@Client.on_message(filters.regex(r"https:\/\/www\.sonyliv\.com\/shows\/.*\/.*"))
-async def sonyliv_handler(client: Client, message: Message):
-    """Handles messages containing SonyLiv links."""
-    url = message.text  # Get the URL from the message
-    await download_and_upload(message, url)
+            await message.edit(
+                text=f"**Downloading:** `{file_name}`\n"
+                     f"**Progress:** `[{bar}] {percentage:.2f}%`\n"
+                     f"**Speed:** `{speed / 1024:.2f} KB/s`\n"
+                     f"**ETA:** `{estimated_time}`\n"
+                     f"**Time Elapsed:** `{time_elapsed}`"
+            )
+        except MessageNotModified:
+            pass
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
 
 
-# Command handler to start the bot
+async def upload_progress(current, total, message: MSG, start_time, file_name):
+    """Displays upload progress bar in Telegram."""
+    now = time.time()
+    diff = now - start_time
+    if round(diff % 3) == 0:  # Update every 3 seconds
+        bar, percentage = create_progress_bar(current, total)
+        speed = current / diff
+        eta = (total - current) / speed
+        time_elapsed = time.strftime("%H:%M:%S", time.gmtime(diff))
+        estimated_time = time.strftime("%H:%M:%S", time.gmtime(eta))
+
+        try:
+            await message.edit(
+                text=f"**Uploading:** `{file_name}`\n"
+                     f"**Progress:** `[{bar}] {percentage:.2f}%`\n"
+                     f"**Speed:** `{speed / 1024:.2f} KB/s`\n"
+                     f"**ETA:** `{estimated_time}`\n"
+                     f"**Time Elapsed:** `{time_elapsed}`"
+            )
+        except MessageNotModified:
+            pass
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+
+
 @Client.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
-    """Start Command"""
+    """Handles the /start command."""
     await message.reply_text(
-        "Hello! Send me a SonyLiv link, and I'll try to download and upload it for you. I will respond with the state of the download, upload and if it finished successfully. The progress is displayed on the console. You can also set custom thumbnail (send the image) and captions for the video, or I'll attempt to extract the thumbnail from the site. A 4 GB File Restriction is applied."
+        "Hi! I'm a Stream downloader and uploader bot.\n"
+        "Send me a M3U8, MPD, or HTTP link, and I'll download the video and upload it to Telegram.\n\n"
+        "**Commands:**\n"
+        "/start - Start the bot\n"
+        "/set_thumbnail - Set a custom thumbnail\n"
+        "/set_caption - Set a custom caption\n"
+        "/reset_thumbnail - Reset to default thumbnail\n"
+        "/reset_caption - Reset to default caption\n"
     )
+
+
+@Client.on_message(filters.command("set_thumbnail"))
+async def set_thumbnail(client: Client, message: Message):
+    """Handles the /set_thumbnail command."""
+    if message.reply_to_message and message.reply_to_message.photo:
+        photo = await message.reply_to_message.download()
+        CUSTOM_THUMBNAILS[message.from_user.id] = photo
+        await message.reply_text("Custom thumbnail set!")
+    else:
+        await message.reply_text("Reply to a photo to set it as the thumbnail.")
+
+
+@Client.on_message(filters.command("set_caption"))
+async def set_caption(client: Client, message: Message):
+    """Handles the /set_caption command."""
+    caption = message.text.split(" ", 1)[1] if len(message.text.split(" ", 1)) > 1 else None
+    if caption:
+        CUSTOM_CAPTIONS[message.from_user.id] = caption
+        await message.reply_text("Custom caption set!")
+    else:
+        await message.reply_text("Provide a caption after the command. Example: /set_caption My custom caption")
+
+
+@Client.on_message(filters.command("reset_thumbnail"))
+async def reset_thumbnail(client: Client, message: Message):
+    """Handles the /reset_thumbnail command."""
+    if message.from_user.id in CUSTOM_THUMBNAILS:
+        del CUSTOM_THUMBNAILS[message.from_user.id]
+        await message.reply_text("Custom thumbnail reset to default.")
+    else:
+        await message.reply_text("You don't have a custom thumbnail set.")
+
+
+@Client.on_message(filters.command("reset_caption"))
+async def reset_caption(client: Client, message: Message):
+    """Handles the /reset_caption command."""
+    if message.from_user.id in CUSTOM_CAPTIONS:
+        del CUSTOM_CAPTIONS[message.from_user.id]
+        await message.reply_text("Custom caption reset to default.")
+    else:
+        await message.reply_text("You don't have a custom caption set.")
+
+async def download_and_upload(client: Client, message: Message, link: str):
+    """Downloads a video and uploads it to Telegram, handling M3U8, MPD, and HTTP links."""
+    user_id = message.from_user.id
+
+    # Modify yt-dlp options for MKV format and progress reporting
+    YTDL_OPTS['format'] = 'bestvideo+bestaudio/best'
+    YTDL_OPTS['progress_hooks'] = [lambda d: download_progress_hook(d, message, time.time())] # Pass the message object
+
+    temp_file_path = None  # Initialize
+
+    try:
+        with YoutubeDL(YTDL_OPTS) as ydl:
+            info_dict = ydl.extract_info(link, download=False)
+            file_name = info_dict.get('title', 'Stream') + "." + info_dict.get('ext', 'mp4')  # Default to mp4
+            file_name = re.sub(r'[^\w\s.-]', '', file_name) # Remove invalid characters
+            file_name = file_name[:60] # Limit file name length
+
+
+            # Check file size before downloading (this is an estimate and might not be entirely accurate)
+            if 'filesize' in info_dict and info_dict['filesize'] > MAX_FILE_SIZE:
+                await message.reply_text(f"Estimated file size exceeds the maximum allowed size of 4GB. Estimated file size: {info_dict['filesize'] / (1024 * 1024 * 1024):.2f} GB")
+                return
+
+            download_message = await message.reply_text(f"Starting download of `{file_name}`...")
+            start_time = time.time()
+            temp_file_path = os.path.join("./downloads", file_name) # Full path
+
+            # Now download the file
+            ydl.download([link]) #Downloads to the temp_file_path defined in the YTDL_OPTS
+
+            if not os.path.exists(temp_file_path):
+                await download_message.edit_text("Download failed.  Please check the link and try again.")
+                return
+
+
+            # Upload to Telegram
+            upload_message = await message.reply_text(f"Starting upload of `{file_name}`...")
+            start_time = time.time()
+
+            try:
+                thumb = CUSTOM_THUMBNAILS.get(user_id)
+
+                # If user has no custom thumbnail set, try to automatically extract a thumbnail
+                if not thumb:
+                     try:
+                         # Attempt to extract thumbnail using yt-dlp
+                         ydl_opts = {'writesubtitles': False, 'writethumbnail': True, 'quiet': True, 'no_warnings': True}
+                         with YoutubeDL(ydl_opts) as ydl:
+                             info_dict = ydl.extract_info(temp_file_path, download=False)
+                             if 'thumbnail' in info_dict:
+                                 thumb = info_dict['thumbnail']
+                                 # Download the thumbnail if it's a URL
+                                 if thumb.startswith('http'):
+                                     async with aiohttp.ClientSession() as session:
+                                         async with session.get(thumb) as resp:
+                                             if resp.status == 200:
+                                                 thumb = BytesIO(await resp.read()) # Store thumbnail data in memory
+                                                 print("Successfully downloaded thumbnail from URL.")
+                                             else:
+                                                 print(f"Failed to download thumbnail from URL: {resp.status}")
+                                                 thumb = None
+                             else:
+                                print("No thumbnail found using yt-dlp.")
+                                thumb = None
+
+                     except Exception as e:
+                        print(f"Error extracting thumbnail: {e}")
+                        thumb = None
+
+
+                # Default caption
+                caption = CUSTOM_CAPTIONS.get(user_id, f"Uploaded by @{Client.me.username}")
+
+                # Get video duration for proper display in Telegram.  This is important
+                duration = 0 # Set Default
+                try:
+                    ydl_opts = {'quiet': True, 'no_warnings': True}
+                    with YoutubeDL(ydl_opts) as ydl:
+                       info_dict = ydl.extract_info(temp_file_path, download=False)
+                       duration = info_dict.get('duration', 0)
+                except Exception as e:
+                    print(f"Failed to get video duration: {e}")
+
+
+                await Client.send_video(
+                    chat_id=message.chat.id,
+                    video=temp_file_path,
+                    caption=caption,
+                    supports_streaming=True,
+                    thumb=thumb,
+                    duration=duration, # Pass duration
+                    progress=upload_progress,
+                    progress_args=(upload_message, start_time, file_name)
+                )
+
+                await upload_message.delete()
+                await message.reply_text("Upload complete!")
+
+            except Exception as e:
+                await message.reply_text(f"Upload failed: {e}\n\n{traceback.format_exc()}") # Provide full traceback
+                logging.error(f"Upload error: {e}\n{traceback.format_exc()}")
+
+    except yt_dlp.utils.DownloadError as e:
+       await message.reply_text(f"Download failed: {e}")
+       logging.error(f"yt-dlp download error: {e}")
+    except Exception as e:
+        await message.reply_text(f"An unexpected error occurred: {e}\n\n{traceback.format_exc()}")
+        logging.error(f"General error: {e}\n{traceback.format_exc()}")
+
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path) # Clean up the downloaded file
+            except Exception as e:
+                print(f"Failed to delete temporary file: {e}")
+                logging.warning(f"Failed to delete temporary file: {e}")
+        YTDL_OPTS['progress_hooks'] = [] # Remove progress hook
+
+def download_progress_hook(d, message: MSG, start_time):
+    """yt-dlp progress hook to display download progress."""
+    if d['status'] == 'downloading':
+        current = d['downloaded_bytes']
+        total = d['total_bytes']
+        file_name = d['filename']  # Get filename from yt-dlp
+        asyncio.create_task(download_progress(current, total, message, start_time, file_name))
+    elif d['status'] == 'finished':
+        # Download is complete, you can optionally do something here
+        logging.info("Download complete.")
+        pass
+    elif d['status'] == 'error':
+        logging.error(f"Download failed: {d['error']}")
+        # Handle the error here
+
+@Client.on_message(filters.regex(r"https?://\S+"))
+async def link_handler(client: Client, message: Message):
+    """Handles messages containing links."""
+    link = message.text.strip()
+    await download_and_upload(client, message, link)
