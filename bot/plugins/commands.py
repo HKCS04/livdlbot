@@ -2,10 +2,14 @@ import os
 import asyncio
 import re
 import requests
+from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaDocument
-import yt_dlp
-from PIL import Image
+from dotenv import load_dotenv
+from PIL import Image  # for basic image validation
+import youtube_dl
+from bs4 import BeautifulSoup
+import aiohttp
 
 # Progress Bar Characters
 BAR_FILLED = "█"
@@ -29,16 +33,52 @@ def format_progress_bar(percentage):
     bar = BAR_FILLED * filled_length + BAR_EMPTY * (TOTAL_BAR_LENGTH - filled_length)
     return bar
 
-# Custom progress hook for yt-dlp (console output)
-def progress_hook(d):
-    """Displays download progress with a progress bar in the console."""
-    if d['status'] == 'downloading':
-        percentage = d['_percent_str']
-        speed = d['_speed_str']
-        eta = d['_eta_str']
-        progress_bar = format_progress_bar(d['progress'] / 100)
-        message = f"Downloading: {progress_bar} {percentage} | Speed: {speed} | ETA: {eta}"
-        print(message)  # Log the progress in console
+# Function to extract the default thumbnail with aiohttp (async)
+async def get_default_thumbnail(url):
+    """Extracts the thumbnail URL from the webpage using aiohttp and BeautifulSoup."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                response.raise_for_status()  # Raise HTTPError for bad responses
+                html_content = await response.text()
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+        meta_tag = soup.find('meta', property='og:image')  # Use BeautifulSoup to find the meta tag
+        if meta_tag:
+            thumbnail_url = meta_tag['content']
+            return thumbnail_url
+        else:
+            print("Thumbnail URL not found in the HTML.")
+            return None
+
+    except aiohttp.ClientError as e:
+        print(f"Error fetching webpage: {e}")
+        return None
+    except Exception as e:
+        print(f"Error processing HTML: {e}")
+        return None
+
+
+async def download_thumbnail(url):
+    """Downloads a thumbnail from a URL and returns its file path."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                image_data = await response.read()  # Read image data as bytes
+
+        image = Image.open(BytesIO(image_data))
+        thumbnail_path = "default_thumbnail.jpg"
+        image.save(thumbnail_path, "JPEG")
+        return thumbnail_path
+
+    except aiohttp.ClientError as e:
+        print(f"Error downloading thumbnail: {e}")
+        return None
+    except Exception as e:
+        print(f"Error processing thumbnail: {e}")
+        return None
+
 
 # Function to download and upload the video
 async def download_and_upload(message: Message, url: str):
@@ -50,16 +90,14 @@ async def download_and_upload(message: Message, url: str):
             'outtmpl': '%(title)s.%(ext)s',  # Output template
             'merge_output_format': 'mkv',  # Force mkv output to merge video and audio
             'progress_hooks': [progress_hook],  # Add the progress hook for console output
-            'extractor_args': {  # Add these lines for wider support.  Experiment if needed.
-                'hotstar': {
-                    'force_cleartext': True, # attempt to extract the cleartext DASH manifest, this may or may not work depending on the encryption used
-                }
-            },
-             'rejecttitle': True, # DRM is usually present
-             'ignoreerrors': True # DRM is usually present
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=True)  # Download the url file
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:  # Using youtube_dl here
+            try:
+                info_dict = ydl.extract_info(url, download=True)  # Download the url file
+            except youtube_dl.utils.DownloadError as e:
+                await message.reply_text(f"Download Error: {e}")
+                return
+
             file_path = ydl.prepare_filename(info_dict)  # Get the downloaded file path
 
         # Basic File Check
@@ -79,6 +117,15 @@ async def download_and_upload(message: Message, url: str):
         try:
             user_id = message.chat.id
             thumbnail = CUSTOM_THUMBNAIL.get(user_id)
+
+            # If no custom thumbnail, use the default
+            if not thumbnail:
+                default_thumbnail_url = await get_default_thumbnail(url)
+                if default_thumbnail_url:
+                    thumbnail = await download_thumbnail(default_thumbnail_url)
+                else:
+                    thumbnail = None #No thumbnail found at all
+
             caption = CUSTOM_CAPTION.get(user_id, info_dict.get('title', 'Video from URL'))
 
             await app.send_document(chat_id=user_id, document=file_path,
@@ -90,11 +137,10 @@ async def download_and_upload(message: Message, url: str):
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)  # Clean Up the downloaded file
+            if thumbnail == "default_thumbnail.jpg" and os.path.exists(thumbnail):
+                os.remove(thumbnail)  # Remove the default thumbnail
 
         await message.reply_text("Download and Upload complete!")
-
-    except yt_dlp.utils.DownloadError as e:
-        await message.reply_text(f"Error: Download failed.\n{e}")
 
     except Exception as e:
         await message.reply_text(f"An unexpected error occurred:\n{e}")
@@ -113,7 +159,7 @@ async def upload_progress(current, total, chat_id, message_text):
 
 
 # Command handler for setting custom thumbnail using user-sent image
-@app.on_message(filters.photo)  # Listen for photo messages
+@Client.on_message(filters.photo)  # Listen for photo messages
 async def setthumbnail_photo(client: Client, message: Message):
     """Sets the custom thumbnail to the photo sent by the user."""
     user_id = message.chat.id
@@ -145,10 +191,10 @@ async def setcaption_command(client: Client, message: Message):
     else:
         await message.reply_text("Usage: /setcaption <custom_caption>")
 
-# Message handler for Hotstar links
-@Client.on_message(filters.regex(r"https:\/\/www\.hotstar\.com\/in\/.*\/watch"))
-async def hotstar_handler(client: Client, message: Message):
-    """Handles messages containing Hotstar links."""
+# Message handler for SonyLiv links
+@Client.on_message(filters.regex(r"https:\/\/www\.sonyliv\.com\/shows\/.*\/.*"))
+async def sonyliv_handler(client: Client, message: Message):
+    """Handles messages containing SonyLiv links."""
     url = message.text  # Get the URL from the message
     await download_and_upload(message, url)
 
@@ -158,5 +204,5 @@ async def hotstar_handler(client: Client, message: Message):
 async def start_command(client: Client, message: Message):
     """Start Command"""
     await message.reply_text(
-        "Hello! Send me a Hotstar link, and I'll try to download and upload it for you. I will respond with the state of the download, upload and if it finished successfully. The progress is displayed on the console. You can also set custom thumbnail and captions for the video and a 4 GB File Restriction is applied."
+        "Hello! Send me a SonyLiv link, and I'll try to download and upload it for you. I will respond with the state of the download, upload and if it finished successfully. The progress is displayed on the console. You can also set custom thumbnail (send the image) and captions for the video, or I'll attempt to extract the thumbnail from the site. A 4 GB File Restriction is applied."
     )
