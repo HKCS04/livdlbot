@@ -1,9 +1,9 @@
  pyrogram
-  tgcrypto
-  asyncio
-  aiohttp
-  hachoir
-  requests
-  yt-dlp
-  pillow
-  pyromod==1.5
+ tgcrypto
+ asyncio
+ aiohttp
+ hachoir
+ requests
+ yt-dlp
+ pillow
+ pyromod==1.5
